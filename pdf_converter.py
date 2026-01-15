@@ -73,9 +73,11 @@ def extract_pdf_to_text(
 
 if __name__ == "__main__":
 
+    doc = "pdf3"
+
     result = extract_pdf_to_text(
-        "pdf3.pdf",
-        "test3.txt",
+        f"{doc}.pdf",
+        f"{doc}.txt",
     )
 
     result1 = progressive_extract_policy_info_section(result)
@@ -83,7 +85,7 @@ if __name__ == "__main__":
     result3 = progressive_extract_outline_of_coverage(result)
     # Prefer PDF-based extraction for premium discounts to preserve table structure.
     result4 = extract_premium_discounts_from_pdf(
-        "pdf3.pdf"
+        f"{doc}.pdf"
     ) or progressive_extract_premium_discounts(result)
     print("-------- POLICY INFO --------")
     print(json.dumps(result1, indent=2))

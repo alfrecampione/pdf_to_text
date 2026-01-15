@@ -234,6 +234,10 @@ def extract_drivers_section(raw_text: str) -> list[dict[str, str]]:
         if "outline of coverage" in lower:
             break
 
+        if lower.startswith("total residents"):
+            idx += 1
+            continue
+
         if _is_separator(stripped):
             continue
 
