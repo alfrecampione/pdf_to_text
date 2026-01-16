@@ -39,14 +39,9 @@ def _should_drop_line(line: str) -> bool:
     return False
 
 
-def extract_pdf_to_text(
-    pdf_path: str | pathlib.Path,
-    output_path: str | pathlib.Path | None = None,
-) -> str:
+def extract_pdf_to_text(pdf_path: str | pathlib.Path) -> str:
 
     pdf_path = pathlib.Path(pdf_path)
-    if output_path is not None:
-        output_path = pathlib.Path(output_path)
     parts: list[str] = []
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
@@ -65,9 +60,6 @@ def extract_pdf_to_text(
 
     content = "\n".join(part for part in parts if part)
 
-    if output_path:
-        output_path.write_text(content, encoding="utf-8")
-
     return content
 
 
@@ -77,7 +69,6 @@ if __name__ == "__main__":
 
     result = extract_pdf_to_text(
         f"{doc}.pdf",
-        f"{doc}.txt",
     )
 
     result1 = progressive_extract_policy_info_section(result)
