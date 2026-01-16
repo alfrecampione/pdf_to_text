@@ -63,26 +63,36 @@ def extract_pdf_to_text(pdf_path: str | pathlib.Path) -> str:
     return content
 
 
+import os
+
 if __name__ == "__main__":
 
-    doc = "pdf3"
+    pdf_folder = os.listdir("./pdfs")
+    pdf_file_array: list[str] = []
 
-    result = extract_pdf_to_text(
-        f"{doc}.pdf",
-    )
+    for pdf_file in pdf_folder:
+        if not pdf_file.endswith(".pdf"):
+            continue
+        pdf_file_array.append(pdf_file)
 
-    result1 = progressive_extract_policy_info_section(result)
-    result2 = progressive_extract_drivers_section(result)
-    result3 = progressive_extract_outline_of_coverage(result)
-    # Prefer PDF-based extraction for premium discounts to preserve table structure.
-    result4 = extract_premium_discounts_from_pdf(
-        f"{doc}.pdf"
-    ) or progressive_extract_premium_discounts(result)
-    print("-------- POLICY INFO --------")
-    print(json.dumps(result1, indent=2))
-    print("-------- DRIVERS --------")
-    print(json.dumps(result2, indent=2))
-    print("-------- OUTLINE OF COVERAGE --------")
-    print(json.dumps(result3, indent=2))
-    print("-------- PREMIUM DISCOUNTS --------")
-    print(json.dumps(result4, indent=2))
+    for pdf_file in pdf_file_array:
+        print(f"Processing file: {pdf_file}")
+
+        result = extract_pdf_to_text(f"./pdfs/{pdf_file}")
+
+        policy = progressive_extract_policy_info_section(result)
+        drivers = progressive_extract_drivers_section(result)
+        outline = progressive_extract_outline_of_coverage(result)
+        discounts = extract_premium_discounts_from_pdf(
+            f"./pdfs/{pdf_file}"
+        ) or progressive_extract_premium_discounts(result)
+
+        output = {
+            "policy": policy,
+            "drivers": drivers,
+            "outline": outline,
+            "discounts": discounts,
+        }
+
+        with open(f"./outputs/{pdf_file[: -4]}.json", "x") as output_file:
+            json.dump(output, output_file, indent=4)
