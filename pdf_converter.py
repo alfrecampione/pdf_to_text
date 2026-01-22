@@ -3,13 +3,19 @@ from progressive import (
     extract_drivers_section as progressive_extract_drivers_section,
     extract_outline_of_coverage as progressive_extract_outline_of_coverage,
     extract_premium_discounts as progressive_extract_premium_discounts,
-    extract_premium_discounts_from_pdf,
+    extract_premium_discounts_from_pdf as progressive_extract_premium_discounts_from_pdf,
 )
 
 import json
+import os
 import pathlib
-import pdfplumber
 import re
+import tempfile
+from typing import Any
+
+import pdfplumber
+import requests
+import sys
 
 
 def _should_drop_line(line: str) -> bool:
@@ -63,36 +69,51 @@ def extract_pdf_to_text(pdf_path: str | pathlib.Path) -> str:
     return content
 
 
-import os
+def _download_pdf_from_s3(s3_url: str) -> pathlib.Path:
+    """Download the PDF from an S3 URL to a temporary file and return the path."""
+
+    response = requests.get(s3_url, stream=True, timeout=60)
+    response.raise_for_status()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                tmp.write(chunk)
+        return pathlib.Path(tmp.name)
+
+
+def _build_output(pdf_path: str | pathlib.Path) -> dict[str, Any]:
+    """Run all parsers and return the consolidated JSON-friendly object."""
+
+    raw_text = extract_pdf_to_text(pdf_path)
+    policy = progressive_extract_policy_info_section(raw_text)
+    drivers = progressive_extract_drivers_section(raw_text)
+    outline = progressive_extract_outline_of_coverage(raw_text)
+    discounts = progressive_extract_premium_discounts_from_pdf(str(pdf_path))
+
+    return {
+        "policy": policy,
+        "drivers": drivers,
+        "outline": outline,
+        "discounts": discounts,
+    }
+
 
 if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python pdf_converter.py <s3_pdf_url>")
+        raise SystemExit(1)
 
-    pdf_folder = os.listdir("./pdfs")
-    pdf_file_array: list[str] = []
+    s3_url = sys.argv[1]
 
-    for pdf_file in pdf_folder:
-        if not pdf_file.endswith(".pdf"):
-            continue
-        pdf_file_array.append(pdf_file)
+    pdf_tmp_path = _download_pdf_from_s3(s3_url)
 
-    for pdf_file in pdf_file_array:
-        print(f"Processing file: {pdf_file}")
+    try:
+        output = _build_output(pdf_tmp_path)
+    finally:
+        try:
+            os.remove(pdf_tmp_path)
+        except OSError:
+            pass
 
-        result = extract_pdf_to_text(f"./pdfs/{pdf_file}")
-
-        policy = progressive_extract_policy_info_section(result)
-        drivers = progressive_extract_drivers_section(result)
-        outline = progressive_extract_outline_of_coverage(result)
-        discounts = extract_premium_discounts_from_pdf(
-            f"./pdfs/{pdf_file}"
-        ) or progressive_extract_premium_discounts(result)
-
-        output = {
-            "policy": policy,
-            "drivers": drivers,
-            "outline": outline,
-            "discounts": discounts,
-        }
-
-        with open(f"./outputs/{pdf_file[: -4]}.json", "x") as output_file:
-            json.dump(output, output_file, indent=4)
+    print(json.dumps(output, indent=4))
