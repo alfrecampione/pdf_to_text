@@ -17,6 +17,13 @@ import pdfplumber
 import requests
 import sys
 
+from dotenv import load_dotenv
+import boto3
+from urllib.parse import urlparse
+
+
+load_dotenv()
+
 
 def _should_drop_line(line: str) -> bool:
     """Drop known header/footer noise (form codes, RPUID, Doc ID, page markers)."""
@@ -70,16 +77,36 @@ def extract_pdf_to_text(pdf_path: str | pathlib.Path) -> str:
 
 
 def _download_pdf_from_s3(s3_url: str) -> pathlib.Path:
-    """Download the PDF from an S3 URL to a temporary file and return the path."""
+    """
+    Download a private S3 PDF using AWS credentials from .env
+    Windows-safe: avoid NamedTemporaryFile locking issues.
+    """
+    from urllib.parse import urlparse
+    import boto3
+    import os
+    import tempfile
+    import pathlib
 
-    response = requests.get(s3_url, stream=True, timeout=60)
-    response.raise_for_status()
+    parsed = urlparse(s3_url)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        for chunk in response.iter_content(chunk_size=8192):
-            if chunk:
-                tmp.write(chunk)
-        return pathlib.Path(tmp.name)
+    # qqcatalyst-files.s3.us-east-1.amazonaws.com -> qqcatalyst-files
+    bucket = parsed.netloc.split(".")[0]
+    key = parsed.path.lstrip("/")
+
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        region_name=os.getenv("AWS_REGION", "us-east-1"),
+    )
+
+    # Create a temp filename without keeping it open (prevents WinError 32)
+    fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)  # critical on Windows
+
+    tmp_path = pathlib.Path(tmp_path)
+    s3.download_file(bucket, key, str(tmp_path))
+    return tmp_path
 
 
 def _build_output(pdf_path: str | pathlib.Path) -> dict[str, Any]:
