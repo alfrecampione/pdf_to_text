@@ -1,5 +1,7 @@
 from __future__ import annotations
+import pathlib
 import re
+from typing import Any
 import pdfplumber
 
 _SEP_RE = re.compile(r"^[\.\-\u2014\u00b7\u2026]{6,}$")
@@ -35,6 +37,55 @@ def _normalize_key(key: str) -> str:
     key = key.lower()
     key = re.sub(r"[^a-z0-9]+", "_", key)
     return key.strip("_")
+
+
+def _should_drop_line(line: str) -> bool:
+    """Drop known header/footer noise (form codes, RPUID, Doc ID, page markers)."""
+    s = line.strip()
+    if not s:
+        return False
+    lower = s.lower()
+
+    if lower.startswith("# page"):
+        return True
+    if lower.startswith("policy number:"):
+        return True
+    if lower.startswith("form_"):
+        return True
+    if "rpuid" in lower:
+        return True
+    if lower.startswith("doc id:"):
+        return True
+    if lower.startswith("continued"):
+        return True
+    if re.match(r"^page \d+ of \d+", lower):
+        return True
+    if s.isdigit() and len(s) <= 3:
+        return True
+    return False
+
+
+def extract_pdf_to_text(pdf_path: str | pathlib.Path) -> str:
+    pdf_path = pathlib.Path(pdf_path)
+    parts: list[str] = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            lines = text.splitlines()
+
+            cleaned_lines = []
+            for line in lines:
+                if _should_drop_line(line):
+                    continue
+                cleaned_lines.append(line.strip())
+
+            if cleaned_lines:
+                parts.append("\n".join(cleaned_lines))
+                parts.append("\n\n")
+
+    content = "\n".join(part for part in parts if part)
+
+    return content
 
 
 def _looks_like_person_name(text: str) -> bool:
@@ -412,102 +463,354 @@ def extract_premium_discounts(raw_text: str) -> list[dict[str, str]]:
             idx += 1
             continue
 
-        tokens = stripped.split()
-        if not tokens:
-            idx += 1
-            continue
+        # Collect a logical row: consecutive non-blank, non-heading, non-separator lines.
+        row_lines = [stripped]
+        look_ahead = idx + 1
+        while look_ahead < len(lines):
+            nxt = lines[look_ahead]
+            nxt_strip = nxt.strip()
+            nxt_lower = nxt_strip.lower()
 
-        # Stop if we reach another section once we've collected rows.
-        if (
-            results
-            and not line[:1].isspace()
-            and current_heading
-            and not tokens[0].isdigit()
-        ):
-            break
-
-        # If this is a continuation line, append to last discount text.
-        if results and line[:1].isspace():
-            results[-1]["discount"] = f"{results[-1]['discount']} {stripped}".strip()
-            idx += 1
-            continue
-
-        # Generic row: split tokens into key (left column) and discount (right column) at first lowercase token.
-        split_idx = None
-        for i, tok in enumerate(tokens):
-            if any(ch.islower() for ch in tok):
-                split_idx = i
+            if not nxt_strip:
+                break
+            if _is_separator(nxt_strip):
+                break
+            if _looks_like_heading(nxt_strip):
+                break
+            if any(nxt_lower.startswith(sm) for sm in stop_markers):
                 break
 
-        if split_idx is None or split_idx == 0:
-            # Continuation: append to the last parsed row.
-            if results:
-                key_field = _key_field(results[-1])
-                if key_field:
-                    first_tok = tokens[0]
-                    rest = tokens[1:]
+            row_lines.append(nxt_strip)
+            look_ahead += 1
 
-                    if not any(ch.islower() for ch in first_tok):
-                        results[-1][
-                            key_field
-                        ] = f"{results[-1][key_field]} {first_tok}".strip()
-                    else:
-                        rest.insert(0, first_tok)
+        idx = look_ahead
 
-                    if rest:
-                        results[-1][
-                            "discount"
-                        ] = f"{results[-1]['discount']} {' '.join(rest)}".strip()
-            idx += 1
+        row_text = " ".join(row_lines)
+        tokens = row_text.split()
+        if not tokens:
             continue
+
+        # Split key/value by finding the token boundary that best balances left (key) vs right (value).
+        # Aim for right side to be longer; use a simple scoring heuristic.
+        def _segment_score(left: str, right: str) -> int:
+            # Prefer right ~ 1.5x left; penalize empty sides.
+            if not left or not right:
+                return 10_000
+            return abs(len(right) - int(1.5 * len(left)))
+
+        best_idx = None
+        best_score = 10_000
+        for i in range(1, len(tokens)):
+            left = " ".join(tokens[:i])
+            right = " ".join(tokens[i:])
+            score = _segment_score(left, right)
+            if score < best_score:
+                best_score = score
+                best_idx = i
+
+        split_idx = best_idx if best_idx is not None else max(1, len(tokens) // 2)
 
         key_text = " ".join(tokens[:split_idx]).strip()
         discount_text = " ".join(tokens[split_idx:]).strip()
 
         heading_key = current_heading.strip() if current_heading else "Item"
-        results.append({heading_key: key_text, "discount": discount_text})
-        idx += 1
-        continue
 
-        idx += 1
+        if results and key_text and key_text == results[-1].get(heading_key):
+            # Same key as previous row: treat as continuation of value.
+            results[-1]["discount"] = (
+                f"{results[-1]['discount']} {discount_text}"
+            ).strip()
+        else:
+            results.append({heading_key: key_text, "discount": discount_text})
 
     return results
 
 
+def extract_underwriting_information(raw_text: str) -> dict[str, str]:
+    """Extract key/value pairs from the "Underwriting information" section."""
+
+    lines = raw_text.splitlines()
+    start_idx = None
+
+    for idx, line in enumerate(lines):
+        if "underwriting information" in line.lower():
+            start_idx = idx
+            break
+
+    if start_idx is None:
+        return {}
+
+    stop_markers = (
+        "application agreement",
+        "verification of content",
+        "notice of information",
+        "personal injury protection",
+        "# page",
+    )
+
+    result: dict[str, str] = {}
+    current_key: str | None = None
+    buffer: list[str] = []
+
+    for line in lines[start_idx + 1 :]:
+        stripped = line.strip()
+        lower = stripped.lower()
+
+        if any(lower.startswith(sm) for sm in stop_markers):
+            break
+
+        if not stripped:
+            continue
+
+        if _is_separator(stripped):
+            if current_key and buffer:
+                result[current_key] = " ".join(buffer).strip()
+                buffer = []
+            continue
+
+        if ":" in stripped:
+            if current_key and buffer:
+                result[current_key] = " ".join(buffer).strip()
+                buffer = []
+
+            key_part, value_part = stripped.split(":", 1)
+            current_key = _normalize_key(key_part)
+            if value_part.strip():
+                buffer.append(value_part.strip())
+        else:
+            if current_key:
+                buffer.append(stripped)
+
+    if current_key and buffer:
+        result[current_key] = " ".join(buffer).strip()
+
+    return result
+
+
+def build_policy_data(pdf_path: str | pathlib.Path) -> dict[str, Any]:
+    """Extract all structured sections from a Progressive policy PDF."""
+
+    raw_text = extract_pdf_to_text(pdf_path)
+
+    with open("debug_extracted_text.txt", "w", encoding="utf-8") as f:
+        f.write(raw_text)
+
+    policy = extract_policy_info_section(raw_text)
+    drivers = extract_drivers_section(raw_text)
+    outline = extract_outline_of_coverage(raw_text)
+    discounts = extract_premium_discounts_from_pdf(str(pdf_path))
+    underwriting = extract_underwriting_information(raw_text)
+
+    return {
+        "policy": policy,
+        "drivers": drivers,
+        "outline": outline,
+        "discounts": discounts,
+        "underwriting": underwriting,
+    }
+
+
 def extract_premium_discounts_from_pdf(pdf_path: str) -> list[dict[str, str]]:
-    """Extract premium discounts directly from a PDF using page bounding boxes."""
+    """Extract premium discounts by grouping words into rows using coordinates."""
+
+    def _is_stop(text: str) -> bool:
+        lower = text.lower()
+        return lower.startswith("driving history") or lower.startswith(
+            "underwriting information"
+        )
+
+    def _is_heading_text(text: str) -> bool:
+        return _looks_like_heading(text.strip())
+
     results: list[dict[str, str]] = []
+
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             words = page.extract_words() or []
             if not words:
                 continue
-            lines: list[tuple[float, float, float, str]] = []  # (top, bottom, x0, text)
+
+            # Locate vertical bounds of the discounts section.
+            lines_meta: list[tuple[float, float, str]] = []  # (top, bottom, text)
             by_top: dict[float, list[dict[str, object]]] = {}
             for w in words:
                 top = float(w.get("top", 0.0))
                 by_top.setdefault(round(top, 1), []).append(w)
+
             for top_key, items in by_top.items():
                 items_sorted = sorted(items, key=lambda w: float(w.get("x0", 0.0)))
                 text = " ".join(w.get("text", "") for w in items_sorted)
                 bottom = max(float(w.get("bottom", top_key)) for w in items_sorted)
-                x0 = float(items_sorted[0].get("x0", 0.0)) if items_sorted else 0.0
-                lines.append((top_key, bottom, x0, text))
-            lines_sorted = sorted(lines, key=lambda t: (t[0], t[2]))
+                lines_meta.append((top_key, bottom, text))
+
+            lines_meta.sort(key=lambda t: t[0])
             start_line = next(
-                (ln for ln in lines_sorted if "premium discounts" in ln[3].lower()),
-                None,
+                (ln for ln in lines_meta if "premium discounts" in ln[2].lower()), None
             )
-            stop_line = next(
-                (ln for ln in lines_sorted if "driving history" in ln[3].lower()), None
-            )
+            stop_line = next((ln for ln in lines_meta if _is_stop(ln[2])), None)
             if start_line is None:
                 continue
-            start_y = start_line[1]
+
+            start_y = start_line[0]
             stop_y = stop_line[0] if stop_line else page.height
-            crop = page.crop((0, start_y, page.width, stop_y))
-            crop_text = crop.extract_text() or ""
-            part = extract_premium_discounts(crop_text)
-            if part:
-                results.extend(part)
+
+            section_words = [
+                w
+                for w in words
+                if float(w.get("top", 0.0)) >= start_y
+                and float(w.get("bottom", 0.0)) <= stop_y
+            ]
+            if not section_words:
+                continue
+
+            # Group words into text lines by vertical proximity.
+            by_line: dict[float, list[dict[str, object]]] = {}
+            for w in section_words:
+                top = float(w.get("top", 0.0))
+                # tolerance of 1.0 pt to keep same line
+                key = round(top, 1)
+                by_line.setdefault(key, []).append(w)
+
+            text_lines: list[dict[str, object]] = []
+            for key, items in by_line.items():
+                sorted_items = sorted(items, key=lambda w: float(w.get("x0", 0.0)))
+                text = " ".join(w.get("text", "") for w in sorted_items)
+                bottom = max(float(w.get("bottom", key)) for w in sorted_items)
+                text_lines.append(
+                    {"top": key, "bottom": bottom, "words": sorted_items, "text": text}
+                )
+
+            text_lines.sort(key=lambda t: t["top"])
+
+            # Group lines into rows (rows can span multiple lines) using vertical spacing.
+            gaps = [
+                text_lines[i + 1]["top"] - text_lines[i]["bottom"]
+                for i in range(len(text_lines) - 1)
+            ]
+            median_gap = sorted(gaps)[len(gaps) // 2] if gaps else 0.0
+            row_gap_tol = max(4.0, median_gap * 2 or 4.0)
+
+            rows: list[list[dict[str, object]]] = []
+            current_row: list[dict[str, object]] = []
+            last_bottom: float | None = None
+
+            for ln in text_lines:
+                if last_bottom is None or ln["top"] - last_bottom <= row_gap_tol:
+                    current_row.append(ln)
+                    last_bottom = ln["bottom"]
+                else:
+                    if current_row:
+                        rows.append(current_row)
+                    current_row = [ln]
+                    last_bottom = ln["bottom"]
+            if current_row:
+                rows.append(current_row)
+
+            # Estimate gutter (column split) as mid-point of the text block.
+            x0_min = min(float(w.get("x0", 0.0)) for w in section_words)
+            x1_max = max(
+                float(w.get("x1", float(w.get("x0", 0.0)))) for w in section_words
+            )
+            # Shift gutter further left to keep value tokens out of the key column
+            gutter_x = x0_min + 0.42 * (x1_max - x0_min)
+
+            current_heading: str | None = None
+            heading_prefixes = ("policy", "vehicle")
+            sep_re = re.compile(r"^[\.\u00b7\u2026\u2014·]{3,}$")
+
+            for row in rows:
+                # Flatten row words and text.
+                row_words = []
+                for ln in row:
+                    row_words.extend(ln["words"])
+
+                if not row_words:
+                    continue
+
+                row_words_sorted = sorted(
+                    row_words, key=lambda w: float(w.get("x0", 0.0))
+                )
+                row_text = " ".join(w.get("text", "") for w in row_words_sorted).strip()
+                row_text_clean = re.sub(
+                    r"[\.\u00b7\u2026\u2014·]{3,}", " ", row_text
+                ).strip()
+
+                if not row_text_clean:
+                    continue
+
+                if _is_stop(row_text_clean):
+                    break
+
+                lower_clean = row_text_clean.lower()
+
+                # Skip metadata/noise rows (page markers, doc IDs, continued markers).
+                if (
+                    "doc id" in lower_clean
+                    or "continued" in lower_clean
+                    or lower_clean.startswith("# page")
+                ):
+                    continue
+
+                # Detect headings possibly followed by data on the same row (Policy ..., Vehicle ...)
+                heading_detected: str | None = None
+                for pref in heading_prefixes:
+                    if lower_clean.startswith(pref):
+                        heading_detected = pref.capitalize()
+                        break
+
+                if heading_detected:
+                    current_heading = heading_detected
+                    # Remove heading token from words for downstream split
+                    row_words_sorted = [
+                        w
+                        for w in row_words_sorted
+                        if w.get("text", "").lower() != heading_detected.lower()
+                        and not sep_re.match(w.get("text", ""))
+                    ]
+                    # If after removing heading there is no data, move to next row
+                    if not row_words_sorted:
+                        continue
+
+                elif _is_heading_text(row_text_clean):
+                    current_heading = row_text_clean
+                    continue
+
+                if current_heading is None:
+                    continue
+
+                filtered_words = [
+                    w for w in row_words_sorted if not sep_re.match(w.get("text", ""))
+                ]
+
+                left_words = [
+                    w for w in filtered_words if float(w.get("x0", 0.0)) < gutter_x
+                ]
+                right_words = [
+                    w for w in filtered_words if float(w.get("x0", 0.0)) >= gutter_x
+                ]
+
+                left_text = " ".join(w.get("text", "") for w in left_words).strip()
+                right_text = " ".join(w.get("text", "") for w in right_words).strip()
+
+                heading_key = current_heading.strip() if current_heading else "Item"
+
+                if not right_text and results:
+                    # Continuation row: append text to previous discount.
+                    results[-1][
+                        "discount"
+                    ] = f"{results[-1]['discount']} {left_text}".strip()
+                    continue
+
+                if right_text and not left_text and results:
+                    # No key, only value -> continuation of previous value.
+                    results[-1][
+                        "discount"
+                    ] = f"{results[-1]['discount']} {right_text}".strip()
+                    continue
+
+                if not left_text or not right_text:
+                    continue
+
+                results.append({heading_key: left_text, "discount": right_text})
+
     return results
