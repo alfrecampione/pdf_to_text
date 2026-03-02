@@ -53,7 +53,7 @@ def _build_output(pdf_path: str | pathlib.Path, carrierId: int) -> dict[str, obj
         case 2:  # Progressive
             return progressive_build_policy_data(pdf_path)
         case _:  # Unsupported carrier
-            raise ValueError(f"Unsupported carrierId: {carrierId}")
+            return None
 
 
 if __name__ == "__main__":
@@ -62,7 +62,11 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     s3_url = sys.argv[1]
-    carrierId = int(sys.argv[2]) if len(sys.argv) > 2 else None
+    carrierId = int(sys.argv[2]) if len(sys.argv) > 2 else -1
+
+    if carrierId == -1:
+        print(None)
+        raise SystemExit(1)
 
     pdf_tmp_path = _download_pdf_from_s3(s3_url)
     # pdf_tmp_path = "./test1.pdf"  # For local testing without S3
